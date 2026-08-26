@@ -1,42 +1,52 @@
 ---
-- name: Install and configure Prometheus Node Exporter
+- name: Install Node Exporter on any Linux server
   hosts: all
   become: true
   gather_facts: true
 
   vars:
     node_exporter_version: "1.9.1"
-    node_exporter_user: "node_exporter"
     node_exporter_port: 9100
-    node_exporter_install_dir: "/usr/local/bin"
+    node_exporter_binary: "/usr/local/bin/node_exporter"
     node_exporter_archive: "/tmp/node_exporter.tar.gz"
+    node_exporter_extract_dir: "/tmp/node_exporter-{{ node_exporter_version }}.linux-amd64"
 
   tasks:
 
     # ============================================================
-    # SYSTEM INFORMATION
+    # SERVER INFORMATION
     # ============================================================
 
-    - name: Display target server
+    - name: Display target server information
       ansible.builtin.debug:
         msg:
-          - "Installing Node Exporter on {{ inventory_hostname }}"
-          - "IP Address: {{ ansible_host | default(inventory_hostname) }}"
-          - "Operating System: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "Server: {{ inventory_hostname }}"
+          - "IP: {{ ansible_host | default(inventory_hostname) }}"
+          - "OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
           - "Architecture: {{ ansible_architecture }}"
 
 
     # ============================================================
-    # CREATE NODE EXPORTER USER
+    # CHECK ARCHITECTURE
     # ============================================================
 
-    - name: Create node_exporter user
-      ansible.builtin.user:
-        name: "{{ node_exporter_user }}"
-        system: true
-        shell: /usr/sbin/nologin
-        create_home: false
-        state: present
+    - name: Verify supported architecture
+      ansible.builtin.assert:
+        that:
+          - ansible_architecture in ['x86_64', 'amd64']
+        fail_msg: >
+          Unsupported architecture {{ ansible_architecture }}.
+          This playbook currently supports x86_64/amd64 only.
+
+
+    # ============================================================
+    # CHECK EXISTING NODE EXPORTER
+    # ============================================================
+
+    - name: Check whether Node Exporter already exists
+      ansible.builtin.stat:
+        path: "{{ node_exporter_binary }}"
+      register: node_exporter_binary_check
 
 
     # ============================================================
@@ -48,7 +58,8 @@
         url: "https://github.com/prometheus/node_exporter/releases/download/v{{ node_exporter_version }}/node_exporter-{{ node_exporter_version }}.linux-amd64.tar.gz"
         dest: "{{ node_exporter_archive }}"
         mode: "0644"
-        timeout: 60
+        timeout: 120
+      when: not node_exporter_binary_check.stat.exists
 
 
     # ============================================================
@@ -60,7 +71,7 @@
         src: "{{ node_exporter_archive }}"
         dest: "/tmp"
         remote_src: true
-        creates: "/tmp/node_exporter-{{ node_exporter_version }}.linux-amd64/node_exporter"
+      when: not node_exporter_binary_check.stat.exists
 
 
     # ============================================================
@@ -69,17 +80,24 @@
 
     - name: Install Node Exporter binary
       ansible.builtin.copy:
-        src: "/tmp/node_exporter-{{ node_exporter_version }}.linux-amd64/node_exporter"
-        dest: "{{ node_exporter_install_dir }}/node_exporter"
+        src: "{{ node_exporter_extract_dir }}/node_exporter"
+        dest: "{{ node_exporter_binary }}"
         remote_src: true
         owner: root
         group: root
         mode: "0755"
+      notify: Restart Node Exporter
 
 
     # ============================================================
     # CREATE SYSTEMD SERVICE
     # ============================================================
+    #
+    # IMPORTANT:
+    # We deliberately DO NOT create a node_exporter Linux user.
+    #
+    # Node Exporter runs using the existing "nobody" account.
+    #
 
     - name: Create Node Exporter systemd service
       ansible.builtin.copy:
@@ -96,8 +114,9 @@
 
           [Service]
           Type=simple
-          User=node_exporter
-          Group=node_exporter
+
+          User=nobody
+          Group=nobody
 
           ExecStart=/usr/local/bin/node_exporter \
             --web.listen-address=0.0.0.0:9100
@@ -106,16 +125,17 @@
           RestartSec=5
 
           NoNewPrivileges=true
-          ProtectSystem=strict
-          ProtectHome=true
           PrivateTmp=true
+          ProtectSystem=full
+          ProtectHome=true
 
           [Install]
           WantedBy=multi-user.target
+      notify: Restart Node Exporter
 
 
     # ============================================================
-    # START NODE EXPORTER
+    # SYSTEMD RELOAD
     # ============================================================
 
     - name: Reload systemd
@@ -123,11 +143,19 @@
         daemon_reload: true
 
 
+    # ============================================================
+    # ENABLE NODE EXPORTER
+    # ============================================================
+
     - name: Enable Node Exporter
       ansible.builtin.systemd:
         name: node_exporter
         enabled: true
 
+
+    # ============================================================
+    # START NODE EXPORTER
+    # ============================================================
 
     - name: Start Node Exporter
       ansible.builtin.systemd:
@@ -136,10 +164,10 @@
 
 
     # ============================================================
-    # CHECK SERVICE
+    # CHECK SERVICE STATUS
     # ============================================================
 
-    - name: Check Node Exporter service
+    - name: Get Node Exporter service status
       ansible.builtin.systemd:
         name: node_exporter
       register: node_exporter_service
@@ -156,16 +184,16 @@
     # CHECK PORT 9100
     # ============================================================
 
-    - name: Check Node Exporter port
+    - name: Wait for Node Exporter port 9100
       ansible.builtin.wait_for:
         host: 127.0.0.1
         port: "{{ node_exporter_port }}"
-        timeout: 10
         state: started
+        timeout: 15
 
 
     # ============================================================
-    # CHECK METRICS ENDPOINT
+    # CHECK METRICS
     # ============================================================
 
     - name: Check Node Exporter metrics endpoint
@@ -173,31 +201,46 @@
         url: "http://127.0.0.1:{{ node_exporter_port }}/metrics"
         method: GET
         status_code: 200
-        return_content: false
+        timeout: 10
       register: node_exporter_metrics
 
 
+    - name: Display metrics endpoint result
+      ansible.builtin.debug:
+        msg: "Node Exporter metrics endpoint is working on port {{ node_exporter_port }}"
+
+
     # ============================================================
-    # FIREWALL
+    # CHECK FIREWALL
     # ============================================================
 
-    - name: Check if firewalld is installed
+    - name: Check firewalld status
       ansible.builtin.command:
         cmd: firewall-cmd --state
-      register: firewalld_state
-      failed_when: false
+      register: firewalld_status
       changed_when: false
+      failed_when: false
 
 
-    - name: Allow Node Exporter port through firewalld
-      ansible.posix.firewalld:
-        port: "{{ node_exporter_port }}/tcp"
-        permanent: true
-        immediate: true
-        state: enabled
+    - name: Open TCP 9100 in firewalld
+      ansible.builtin.command:
+        cmd: firewall-cmd --permanent --add-port=9100/tcp
+      register: firewall_add
+      changed_when: "'success' in firewall_add.stdout"
       when:
-        - firewalld_state.rc == 0
-        - firewalld_state.stdout == "running"
+        - firewalld_status.rc == 0
+        - firewalld_status.stdout | trim == "running"
+
+
+    - name: Reload firewalld
+      ansible.builtin.command:
+        cmd: firewall-cmd --reload
+      changed_when: true
+      when:
+        - firewalld_status.rc == 0
+        - firewalld_status.stdout | trim == "running"
+        - firewall_add is defined
+        - firewall_add.changed
 
 
     # ============================================================
@@ -212,7 +255,7 @@
 
     - name: Remove extracted Node Exporter directory
       ansible.builtin.file:
-        path: "/tmp/node_exporter-{{ node_exporter_version }}.linux-amd64"
+        path: "{{ node_exporter_extract_dir }}"
         state: absent
 
 
@@ -220,17 +263,32 @@
     # FINAL RESULT
     # ============================================================
 
-    - name: Node Exporter installation completed
+    - name: Display installation result
       ansible.builtin.debug:
         msg:
-          - "============================================================"
+          - "=========================================================="
           - "Node Exporter installation completed"
-          - "============================================================"
-          - "Server       : {{ inventory_hostname }}"
-          - "IP           : {{ ansible_host | default(inventory_hostname) }}"
-          - "Version      : {{ node_exporter_version }}"
-          - "Port         : {{ node_exporter_port }}"
-          - "Service      : node_exporter"
-          - "Metrics URL  : http://{{ ansible_host | default(inventory_hostname) }}:9100/metrics"
-          - "Status       : {{ node_exporter_service.status.ActiveState }}"
-          - "============================================================"
+          - "=========================================================="
+          - "Server      : {{ inventory_hostname }}"
+          - "IP          : {{ ansible_host | default(inventory_hostname) }}"
+          - "OS          : {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "Architecture: {{ ansible_architecture }}"
+          - "Version     : {{ node_exporter_version }}"
+          - "Port        : {{ node_exporter_port }}"
+          - "Service     : node_exporter"
+          - "Run User    : nobody"
+          - "Status      : {{ node_exporter_service.status.ActiveState }}"
+          - "Metrics     : http://{{ ansible_host | default(inventory_hostname) }}:9100/metrics"
+          - "=========================================================="
+
+  # ============================================================
+  # HANDLERS
+  # ============================================================
+
+  handlers:
+
+    - name: Restart Node Exporter
+      ansible.builtin.systemd:
+        name: node_exporter
+        state: restarted
+        daemon_reload: true
